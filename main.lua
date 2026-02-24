@@ -892,10 +892,9 @@ CreateConfigWindow = function()
     end
     groupNameEditBox:SetHandler("OnTextChanged", groupNameEditBox.OnTextChanged)
 
-    -- "Show only if miss" checkbox
+    -- "Show only if miss" checkbox (anchored later to hint row)
     showOnlyMissCB = api.Interface:CreateWidget("checkbutton", "btwShowOnlyMissCB", settingsWindow)
     showOnlyMissCB:SetExtent(18, 17)
-    showOnlyMissCB:AddAnchor("LEFT", groupNameEditBox, "RIGHT", 12, 0)
 
     local function SetCBBackground(state, x, y)
         local bg = showOnlyMissCB:CreateImageDrawable("ui/button/check_button.dds", "background")
@@ -935,8 +934,8 @@ CreateConfigWindow = function()
     showOnlyMissCB:SetHandler("OnCheckChanged", showOnlyMissCB.OnCheckChanged)
 
     local missLabel = settingsWindow:CreateChildWidget("label", "btwMissLabel", 0, true)
-    missLabel:AddAnchor("LEFT", showOnlyMissCB, "RIGHT", 4, 0)
-    missLabel:SetExtent(60, 20)
+    missLabel:AddAnchor("LEFT", showOnlyMissCB, "RIGHT", -25, 0)
+    missLabel:SetExtent(180, 20)
     missLabel:SetText("Show only when not buffed")
     missLabel.style:SetFontSize(11)
     ApplyTextColor(missLabel, FONT_COLOR.DARK_GRAY)
@@ -950,7 +949,10 @@ CreateConfigWindow = function()
     ApplyTextColor(hintLabel, FONT_COLOR.DARK_GRAY)
     hintLabel.style:SetAlign(ALIGN.LEFT)
     hintLabel:AddAnchor("TOPLEFT", settingsWindow, leftPad, rowY)
-    hintLabel:SetExtent(500, 16)
+    hintLabel:SetExtent(350, 16)
+
+    -- Anchor checkbox + label on same row as hint
+    showOnlyMissCB:AddAnchor("LEFT", hintLabel, "RIGHT", 12, 0)
 
     rowY = rowY + 22
 
