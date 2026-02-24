@@ -1,9 +1,7 @@
 local api = require("api")
 local michaelClientLib = require("buff_dementia/michael_client")
 
--- Try to load TTP's static buff list
-local ok, staticBuffList = pcall(require, "TrackThatPlease/static_buff_list")
-if not ok then staticBuffList = nil end
+local staticBuffList = require("buff_dementia/static_buff_list")
 
 local buff_dementia = {
     name = "Buff Dementia",
@@ -270,7 +268,6 @@ end
 
 local function InitBuffData()
     allBuffs = {}
-    if not staticBuffList then return end
     ddsData = staticBuffList.ddsData or {}
     for _, buff in ipairs(staticBuffList.ALL_BUFFS) do
         table.insert(allBuffs, {
