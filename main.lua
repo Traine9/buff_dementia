@@ -39,6 +39,7 @@ local configGroups = {}
 local currentGroupIndex = 1
 local suppressNameChange = false
 local allBuffs = {}
+local allBuffsById = {}
 local ddsData = {}
 local filteredBuffs = {}
 local buffScrollList
@@ -191,7 +192,8 @@ local function OnUpdate(dt)
     local tracked = settings.tracked_icons
     if not tracked or #tracked == 0 then return end
 
-    for k in pairs(activeBuffs) do activeBuffs[k] = nil end
+    -- Mark all entries as stale, then update in-place to avoid table churn
+    for _, v in pairs(activeBuffs) do v.timeLeft = -1 end
     local buffCount = api.Unit:UnitBuffCount("player") or 0
     for i = 1, buffCount do
         local buff = api.Unit:UnitBuff("player", i)
@@ -201,11 +203,15 @@ local function OnUpdate(dt)
             local existing = activeBuffs[id]
             if existing == nil then
                 activeBuffs[id] = { timeLeft = t, path = buff.path }
-            elseif t < existing.timeLeft then
+            elseif existing.timeLeft == -1 or t < existing.timeLeft then
                 existing.timeLeft = t
                 existing.path = buff.path
             end
         end
+    end
+    -- Remove stale entries (buff no longer active)
+    for k, v in pairs(activeBuffs) do
+        if v.timeLeft == -1 then activeBuffs[k] = nil end
     end
 
     for i = 1, #tracked do
@@ -233,31 +239,23 @@ local function OnUpdate(dt)
         end
 
         if entry.show_only_miss then
-            if lowestTime then
-                slot.icon:SetAlpha(0)
-                slot.timeLabel:SetText("")
-                slot.timeLabel:Show(false)
+            slot.icon:SetAlpha(lowestTime and 0 or INACTIVE_ALPHA)
+            slot.timeLabel:SetText("")
+            slot.timeLabel:Show(false)
+        elseif lowestTime then
+            slot.icon:SetAlpha(1)
+            slot.timeLabel:SetAlpha(1)
+            if lowestTime > 0 then
+                slot.timeLabel:SetText(FormatTime(lowestTime))
+                slot.timeLabel:Show(true)
             else
-                slot.icon:SetAlpha(INACTIVE_ALPHA)
                 slot.timeLabel:SetText("")
                 slot.timeLabel:Show(false)
             end
         else
-            if lowestTime then
-                slot.icon:SetAlpha(1)
-                slot.timeLabel:SetAlpha(1)
-                if lowestTime > 0 then
-                    slot.timeLabel:SetText(FormatTime(lowestTime))
-                    slot.timeLabel:Show(true)
-                else
-                    slot.timeLabel:SetText("")
-                    slot.timeLabel:Show(false)
-                end
-            else
-                slot.icon:SetAlpha(INACTIVE_ALPHA)
-                slot.timeLabel:SetText("")
-                slot.timeLabel:Show(false)
-            end
+            slot.icon:SetAlpha(INACTIVE_ALPHA)
+            slot.timeLabel:SetText("")
+            slot.timeLabel:Show(false)
         end
     end
 end
@@ -268,13 +266,16 @@ end
 
 local function InitBuffData()
     allBuffs = {}
+    allBuffsById = {}
     ddsData = staticBuffList.ddsData or {}
     for _, buff in ipairs(staticBuffList.ALL_BUFFS) do
-        table.insert(allBuffs, {
+        local entry = {
             id = buff.id,
             name = buff.name,
             iconPath = GetBuffIconPath(buff.id)
-        })
+        }
+        table.insert(allBuffs, entry)
+        allBuffsById[buff.id] = entry
     end
     table.sort(allBuffs, function(a, b)
         return string.lower(a.name) < string.lower(b.name)
@@ -324,7 +325,7 @@ local function SetIconForCurrentGroup(buffId)
     table.insert(group.buff_ids, buffId)
 end
 
-local function SaveConfig()
+local function SaveConfig(skipRebuild)
     settings.tracked_icons = DeepCopyGroups(configGroups, true)
     if perRowEditBox then
         local val = tonumber(perRowEditBox:GetText()) or 0
@@ -332,8 +333,10 @@ local function SaveConfig()
         settings.buffs_per_row = val
     end
     api.SaveSettings()
-    BuildBar()
-    updateTimer = UPDATE_INTERVAL -- force immediate buff check on next frame
+    if not skipRebuild then
+        BuildBar()
+        updateTimer = UPDATE_INTERVAL -- force immediate buff check on next frame
+    end
 end
 
 local CommitChange
@@ -468,18 +471,25 @@ FillBuffList = function(pageIndex, searchText)
         -- Show only buffs selected in the current group
         if group and group.buff_ids then
             for _, bid in ipairs(group.buff_ids) do
-                -- Find buff info from allBuffs
-                for _, buff in ipairs(allBuffs) do
-                    if buff.id == bid then
-                        if searchText == "" or string.find(buff.name:lower(), searchText:lower(), 1, true) then
-                            table.insert(filteredBuffs, {
-                                id = buff.id,
-                                name = buff.name,
-                                iconPath = buff.iconPath,
-                                relevanceScore = 0
-                            })
-                        end
-                        break
+                local buff = allBuffsById[bid]
+                if buff then
+                    if searchText == "" or string.find(buff.name:lower(), searchText:lower(), 1, true) then
+                        table.insert(filteredBuffs, {
+                            id = buff.id,
+                            name = buff.name,
+                            iconPath = buff.iconPath,
+                            relevanceScore = 0
+                        })
+                    end
+                else
+                    local fallbackName = "Buff #" .. string.format("%d", bid)
+                    if searchText == "" or string.find(fallbackName:lower(), searchText:lower(), 1, true) then
+                        table.insert(filteredBuffs, {
+                            id = bid,
+                            name = fallbackName,
+                            iconPath = nil,
+                            relevanceScore = 0
+                        })
                     end
                 end
             end
@@ -510,6 +520,17 @@ FillBuffList = function(pageIndex, searchText)
         end
     end
 
+    -- Sort by relevance then alphabetically (must happen before pagination)
+    if #filteredBuffs > 0 then
+        table.sort(filteredBuffs, function(a, b)
+            if a.relevanceScore ~= b.relevanceScore then
+                return a.relevanceScore > b.relevanceScore
+            else
+                return string.lower(a.name) < string.lower(b.name)
+            end
+        end)
+    end
+
     -- Pagination
     local maxPages = math.ceil(#filteredBuffs / pageSize)
     if maxPages < 1 then maxPages = 1 end
@@ -528,17 +549,6 @@ FillBuffList = function(pageIndex, searchText)
         else
             filteredCountLabel:SetText(string.format("Displayed: %d", #filteredBuffs))
         end
-    end
-
-    -- Sort by relevance then alphabetically
-    if #filteredBuffs <= 400 and #filteredBuffs > 0 then
-        table.sort(filteredBuffs, function(a, b)
-            if a.relevanceScore ~= b.relevanceScore then
-                return a.relevanceScore > b.relevanceScore
-            else
-                return string.lower(a.name) < string.lower(b.name)
-            end
-        end)
     end
 
     -- Populate scroll list page
@@ -566,12 +576,8 @@ UpdateGroupDropdown = function()
         if group.name and group.name ~= "" then
             groupName = group.name
         elseif group.icon_id and group.icon_id > 0 then
-            for _, buff in ipairs(allBuffs) do
-                if buff.id == group.icon_id then
-                    groupName = buff.name
-                    break
-                end
-            end
+            local buff = allBuffsById[group.icon_id]
+            if buff then groupName = buff.name end
         end
         table.insert(items, string.format("%s (%d)", groupName, buffCount))
     end
@@ -812,7 +818,7 @@ CreateConfigWindow = function()
     perRowEditBox:SetText(tostring(settings.buffs_per_row or 0))
 
     function perRowEditBox:OnTextChanged()
-        SaveConfig()
+        SaveConfig(false)
     end
     perRowEditBox:SetHandler("OnTextChanged", perRowEditBox.OnTextChanged)
 
@@ -837,6 +843,7 @@ CreateConfigWindow = function()
     addByIdBtn:SetExtent(60, 26)
     addByIdBtn:SetText("Add")
     addByIdBtn:AddAnchor("LEFT", addByIdEditBox, "RIGHT", 8, 0)
+
     function addByIdBtn:OnClick()
         local text = addByIdEditBox:GetText()
         local buffId = tonumber(text)
@@ -884,40 +891,53 @@ CreateConfigWindow = function()
         local group = configGroups[currentGroupIndex]
         if not group then return end
         group.name = groupNameEditBox:GetText() or ""
-        SaveConfig()
+        SaveConfig(true)
         UpdateGroupDropdown()
     end
     groupNameEditBox:SetHandler("OnTextChanged", groupNameEditBox.OnTextChanged)
+
+    -- Print Buffs button
+    local printBtn = settingsWindow:CreateChildWidget("button", "btwPrintBuffsBtn", 0, true)
+    api.Interface:ApplyButtonSkin(printBtn, BUTTON_BASIC.DEFAULT)
+    printBtn:SetExtent(80, 26)
+    printBtn:SetText("Print Buffs")
+    printBtn:AddAnchor("LEFT", groupNameEditBox, "RIGHT", 12, 0)
+    function printBtn:OnClick()
+        local buffCount = api.Unit:UnitBuffCount("player") or 0
+        api.Log:Info("--- Player Buffs (" .. buffCount .. ") ---")
+        for i = 1, buffCount do
+            local buff = api.Unit:UnitBuff("player", i)
+            if buff and buff.buff_id then
+                local buffId = tonumber(buff.buff_id) or 0
+                local id = string.format("%d", buffId)
+                local known = allBuffsById[buffId]
+                local name = (known and known.name) or "Unknown"
+                api.Log:Info(name .. " [" .. id .. "]")
+            end
+        end
+        api.Log:Info("--- End of Buffs ---")
+    end
+    printBtn:SetHandler("OnClick", printBtn.OnClick)
 
     -- "Show only if miss" checkbox (anchored later to hint row)
     showOnlyMissCB = api.Interface:CreateWidget("checkbutton", "btwShowOnlyMissCB", settingsWindow)
     showOnlyMissCB:SetExtent(18, 17)
 
-    local function SetCBBackground(state, x, y)
+    local cbStates = {
+        { "SetNormalBackground",          0,  0 },
+        { "SetHighlightBackground",       0,  0 },
+        { "SetPushedBackground",          0,  0 },
+        { "SetDisabledBackground",        0, 17 },
+        { "SetCheckedBackground",        18,  0 },
+        { "SetDisabledCheckedBackground", 18, 17 },
+    }
+    for _, s in ipairs(cbStates) do
         local bg = showOnlyMissCB:CreateImageDrawable("ui/button/check_button.dds", "background")
         bg:SetExtent(18, 17)
         bg:AddAnchor("CENTER", showOnlyMissCB, 0, 0)
-        bg:SetCoords(x, y, 18, 17)
-        if state == "normal" then
-            showOnlyMissCB:SetNormalBackground(bg)
-        elseif state == "highlight" then
-            showOnlyMissCB:SetHighlightBackground(bg)
-        elseif state == "pushed" then
-            showOnlyMissCB:SetPushedBackground(bg)
-        elseif state == "disabled" then
-            showOnlyMissCB:SetDisabledBackground(bg)
-        elseif state == "checked" then
-            showOnlyMissCB:SetCheckedBackground(bg)
-        elseif state == "disabledChecked" then
-            showOnlyMissCB:SetDisabledCheckedBackground(bg)
-        end
+        bg:SetCoords(s[2], s[3], 18, 17)
+        showOnlyMissCB[s[1]](showOnlyMissCB, bg)
     end
-    SetCBBackground("normal", 0, 0)
-    SetCBBackground("highlight", 0, 0)
-    SetCBBackground("pushed", 0, 0)
-    SetCBBackground("disabled", 0, 17)
-    SetCBBackground("checked", 18, 0)
-    SetCBBackground("disabledChecked", 18, 17)
 
     local group = configGroups[currentGroupIndex]
     showOnlyMissCB:SetChecked(group and group.show_only_miss or false)
@@ -1002,9 +1022,6 @@ local function OnLoad()
             settings[k] = v
         end
     end
-    settings.tracked_icons = DeepCopyGroups(settings.tracked_icons, true)
-    api.SaveSettings()
-
     -- Create bar window
     barWindow = api.Interface:CreateEmptyWindow("buffDementiaBar")
     barWindow:Show(true)
@@ -1047,7 +1064,6 @@ local function OnLoad()
 end
 
 local function OnUnload()
-    settings.tracked_icons = DeepCopyGroups(settings.tracked_icons, true)
     api.On("UPDATE", function() end)
 
     -- Free bar icon widgets
@@ -1078,6 +1094,7 @@ local function OnUnload()
     configGroups = {}
     filteredBuffs = {}
     allBuffs = {}
+    allBuffsById = {}
     ddsData = {}
     activeBuffs = {}
 
