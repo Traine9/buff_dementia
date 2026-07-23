@@ -6,11 +6,13 @@ local staticBuffList = require("buff_dementia/static_buff_list")
 local buff_dementia = {
     name = "Buff Dementia",
     author = "Iridiscent",
-    version = "2.0.0",
+    version = "2.2.0",
     desc = "Configurable buff bar"
 }
 
--- Defaults
+-- Defaults. These keys define what a *profile* holds; the root settings table
+-- doubles as the shared profile, so this list must not contain per_character
+-- or characters (those live only at the root).
 local DEFAULT_SETTINGS = {
     enabled = true,
     x = 300,
@@ -25,7 +27,9 @@ local DEFAULT_SETTINGS = {
 }
 
 -- Bar state
-local settings
+local settingsRoot      -- persisted table: shared profile + per_character + characters
+local settings          -- active profile (settingsRoot, or settingsRoot.characters[key])
+local characterKey      -- lowercase character name, nil until the player unit resolves
 local barWindow
 local iconSlots = {}
 local INACTIVE_ALPHA = 0.3
@@ -48,6 +52,9 @@ local searchEditBox
 local groupDropdown
 local groupNameEditBox
 local showOnlyMissCB
+local perCharCB
+local suppressPerCharChange = false
+local RefreshConfigUI   -- defined with the config window, needed earlier by OnUpdate
 local categoryDropdown
 local filteredCountLabel
 local pageSize = 50
@@ -78,6 +85,61 @@ end
 local function GetBuffIconPath(buffId)
     local path = ddsData[buffId]
     if path then return "game/ui/icon/" .. path end
+    return nil
+end
+
+local function DeepCopyValue(value)
+    if type(value) ~= "table" then return value end
+    local copy = {}
+    for k, v in pairs(value) do
+        copy[k] = DeepCopyValue(v)
+    end
+    return copy
+end
+
+-- Fill in any missing profile keys. Copies defaults so profiles never share a
+-- table reference with DEFAULT_SETTINGS.
+local function ApplyDefaults(profile)
+    for k, v in pairs(DEFAULT_SETTINGS) do
+        if profile[k] == nil then
+            profile[k] = DeepCopyValue(v)
+        end
+    end
+    return profile
+end
+
+-- Extract only the profile keys from a source table, so seeding a character
+-- profile from the root never drags per_character/characters along with it.
+local function CopyProfile(source)
+    local copy = {}
+    if type(source) == "table" then
+        for k in pairs(DEFAULT_SETTINGS) do
+            if source[k] ~= nil then
+                copy[k] = DeepCopyValue(source[k])
+            end
+        end
+    end
+    return ApplyDefaults(copy)
+end
+
+-- The player unit is not always available when the addon loads, and
+-- GetUnitInfoById is blocked on current clients, so try the cheap token-based
+-- getter first and guard every call. Returns nil while the name is unknown.
+local function ResolvePlayerName()
+    local ok, name = pcall(function() return api.Unit:UnitName("player") end)
+    if ok and type(name) == "string" and name ~= "" then return name end
+
+    local okId, playerId = pcall(function() return api.Unit:GetUnitId("player") end)
+    if not okId or not playerId then return nil end
+
+    local okById, byId = pcall(function() return api.Unit:GetUnitNameById(playerId) end)
+    if okById and type(byId) == "string" and byId ~= "" then return byId end
+
+    local okInfo, info = pcall(function() return api.Unit:GetUnitInfoById(playerId) end)
+    if okInfo and type(info) == "table" and type(info.name) == "string" and info.name ~= "" then
+        return info.name
+    end
+
     return nil
 end
 
@@ -181,6 +243,50 @@ local function BuildBar()
 end
 
 ------------------------------------------------------------------------
+-- Profile selection
+------------------------------------------------------------------------
+
+-- Which table the bar should be reading right now. Falls back to the root
+-- (shared) profile whenever per-character mode is off or the name is still
+-- unknown, so the bar is never left without settings.
+local function ResolveActiveProfile()
+    if not settingsRoot then return settings end
+    if not settingsRoot.per_character or not characterKey then return settingsRoot end
+
+    if type(settingsRoot.characters) ~= "table" then
+        settingsRoot.characters = {}
+    end
+
+    local profile = settingsRoot.characters[characterKey]
+    if type(profile) ~= "table" then
+        -- First time we see this character: seed from whatever is active now so
+        -- the bar looks identical before and after the switch.
+        profile = CopyProfile(settings or settingsRoot)
+        settingsRoot.characters[characterKey] = profile
+    else
+        ApplyDefaults(profile)
+    end
+    return profile
+end
+
+-- Point `settings` at the right profile and refresh the bar if it changed.
+-- Returns true when a switch actually happened.
+local function BindProfile(force)
+    local target = ResolveActiveProfile()
+    if not target then return false end
+    if target == settings and not force then return false end
+
+    settings = ApplyDefaults(target)
+    if barWindow then
+        barWindow:RemoveAllAnchors()
+        barWindow:AddAnchor("TOPLEFT", "UIParent", settings.x, settings.y)
+    end
+    BuildBar()
+    updateTimer = UPDATE_INTERVAL -- force an immediate buff check next frame
+    return true
+end
+
+------------------------------------------------------------------------
 -- Per-frame update
 ------------------------------------------------------------------------
 
@@ -189,7 +295,23 @@ local function OnUpdate(dt)
     if updateTimer < UPDATE_INTERVAL then return end
     updateTimer = 0
 
-    local tracked = settings.tracked_icons
+    -- The character name is usually not readable at load time, so keep trying
+    -- once a second until it resolves, then switch to that character's profile.
+    if settingsRoot and settingsRoot.per_character and not characterKey then
+        local name = ResolvePlayerName()
+        if name then
+            characterKey = string.lower(name)
+            if BindProfile(false) and settingsWindow then
+                -- The config window holds a snapshot of the profile that was
+                -- active when it opened. Re-snapshot it, or the next edit would
+                -- write the shared profile's groups into this character's.
+                RefreshConfigUI()
+            end
+            api.SaveSettings()
+        end
+    end
+
+    local tracked = settings and settings.tracked_icons
     if not tracked or #tracked == 0 then return end
 
     -- Mark all entries as stale, then update in-place to avoid table churn
@@ -602,10 +724,9 @@ end
 -- Config: open window (refresh from saved settings)
 ------------------------------------------------------------------------
 
-local function OpenConfigWindow()
-    if not settingsWindow then
-        CreateConfigWindow()
-    end
+-- Reload every control from the active profile. Used both when opening the
+-- window and when the active profile changes underneath it.
+RefreshConfigUI = function()
     configGroups = DeepCopyGroups(settings.tracked_icons)
     currentGroupIndex = 1
     currentCategory = CATEGORY_ALL
@@ -623,7 +744,19 @@ local function OpenConfigWindow()
         local group = configGroups[currentGroupIndex]
         showOnlyMissCB:SetChecked(group and group.show_only_miss or false)
     end
+    if perCharCB then
+        suppressPerCharChange = true
+        perCharCB:SetChecked(settingsRoot and settingsRoot.per_character or false)
+        suppressPerCharChange = false
+    end
     FillBuffList(1, "")
+end
+
+local function OpenConfigWindow()
+    if not settingsWindow then
+        CreateConfigWindow()
+    end
+    RefreshConfigUI()
     settingsWindow:Show(true)
 end
 
@@ -973,6 +1106,46 @@ CreateConfigWindow = function()
 
     rowY = rowY + 22
 
+    -- Per-character settings toggle (own row, below the hint)
+    perCharCB = api.Interface:CreateWidget("checkbutton", "btwPerCharCB", settingsWindow)
+    perCharCB:SetExtent(18, 17)
+    for _, s in ipairs(cbStates) do
+        local bg = perCharCB:CreateImageDrawable("ui/button/check_button.dds", "background")
+        bg:SetExtent(18, 17)
+        bg:AddAnchor("CENTER", perCharCB, 0, 0)
+        bg:SetCoords(s[2], s[3], 18, 17)
+        perCharCB[s[1]](perCharCB, bg)
+    end
+    perCharCB:AddAnchor("TOPLEFT", settingsWindow, leftPad, rowY)
+
+    suppressPerCharChange = true
+    perCharCB:SetChecked(settingsRoot and settingsRoot.per_character or false)
+    suppressPerCharChange = false
+
+    function perCharCB:OnCheckChanged()
+        if suppressPerCharChange then return end
+        if not settingsRoot then return end
+        settingsRoot.per_character = self:GetChecked() and true or false
+        if settingsRoot.per_character and not characterKey then
+            local name = ResolvePlayerName()
+            if name then characterKey = string.lower(name) end
+        end
+        BindProfile(true)
+        api.SaveSettings()
+        RefreshConfigUI()
+    end
+    perCharCB:SetHandler("OnCheckChanged", perCharCB.OnCheckChanged)
+
+    local perCharLabel = settingsWindow:CreateChildWidget("label", "btwPerCharLabel", 0, true)
+    perCharLabel:AddAnchor("LEFT", perCharCB, "RIGHT", -20, 0)
+    perCharLabel:SetExtent(420, 20)
+    perCharLabel:SetText("Per-character settings (each character keeps its own bar and groups)")
+    perCharLabel.style:SetAlign(ALIGN.LEFT)
+    perCharLabel.style:SetFontSize(11)
+    ApplyTextColor(perCharLabel, FONT_COLOR.DARK_GRAY)
+
+    rowY = rowY + 24
+
     -- Buff scroll list
     buffScrollList = W_CTRL.CreatePageScrollListCtrl("btwBuffScrollList", settingsWindow)
     buffScrollList:SetWidth(buffScrollListWidth)
@@ -1016,12 +1189,26 @@ end
 ------------------------------------------------------------------------
 
 local function OnLoad()
-    settings = api.GetSettings("buff_dementia")
-    for k, v in pairs(DEFAULT_SETTINGS) do
-        if settings[k] == nil then
-            settings[k] = v
-        end
+    settingsRoot = api.GetSettings("buff_dementia")
+    if type(settingsRoot) ~= "table" then settingsRoot = {} end
+
+    -- The root table stays exactly as older versions wrote it and doubles as the
+    -- shared profile, so an existing install keeps its bar untouched. The two
+    -- new keys are additive and ignored by older versions.
+    ApplyDefaults(settingsRoot)
+    if settingsRoot.per_character == nil then settingsRoot.per_character = false end
+    if type(settingsRoot.characters) ~= "table" then settingsRoot.characters = {} end
+
+    -- Start on the shared profile, then switch if per-character is enabled and
+    -- the name happens to be readable already. OnUpdate retries otherwise.
+    settings = settingsRoot
+    characterKey = nil
+    if settingsRoot.per_character then
+        local name = ResolvePlayerName()
+        if name then characterKey = string.lower(name) end
     end
+    settings = ApplyDefaults(ResolveActiveProfile())
+
     -- Create bar window
     barWindow = api.Interface:CreateEmptyWindow("buffDementiaBar")
     barWindow:Show(true)
@@ -1089,8 +1276,13 @@ local function OnUnload()
     groupDropdown = nil
     groupNameEditBox = nil
     showOnlyMissCB = nil
+    perCharCB = nil
+    suppressPerCharChange = false
     categoryDropdown = nil
     filteredCountLabel = nil
+    settingsRoot = nil
+    settings = nil
+    characterKey = nil
     configGroups = {}
     filteredBuffs = {}
     allBuffs = {}
