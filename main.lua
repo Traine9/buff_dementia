@@ -1137,7 +1137,9 @@ CreateConfigWindow = function()
     perCharCB:SetHandler("OnCheckChanged", perCharCB.OnCheckChanged)
 
     local perCharLabel = settingsWindow:CreateChildWidget("label", "btwPerCharLabel", 0, true)
-    perCharLabel:AddAnchor("LEFT", perCharCB, "RIGHT", -20, 0)
+    -- Left-aligned label, so the offset is a real gap after the checkbox.
+    -- (missLabel above uses a negative offset only because it is center-aligned.)
+    perCharLabel:AddAnchor("LEFT", perCharCB, "RIGHT", 6, 0)
     perCharLabel:SetExtent(420, 20)
     perCharLabel:SetText("Per-character settings (each character keeps its own bar and groups)")
     perCharLabel.style:SetAlign(ALIGN.LEFT)
